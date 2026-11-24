@@ -1,0 +1,82 @@
+# Authored by agentic-sealer: upstream jackson-1 has no GitHub Actions CI.
+# Mirrors the project's own Ant build (build.xml / ant/build-test.xml):
+#   compile + jar with JDK 7 (public MANIFEST Created-By 1.7), then run the
+#   full `ant test` suite on JDK 6 (the Java 5/6 runtime the 1.9 line targets).
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated fully-qualified test class names to run instead of the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zulu JDK 6 and 7 and Ant 1.8.4
+        id: tools
+        run: |
+          set -euo pipefail
+          cd /tmp
+          for t in zulu6.22.0.3-jdk6.0.119-linux_x64 zulu7.56.0.11-ca-jdk7.0.352-linux_x64; do
+            curl -fsSL -o "$t.tar.gz" "https://cdn.azul.com/zulu/bin/$t.tar.gz"
+            sudo tar -xzf "$t.tar.gz" -C /opt
+          done
+          curl -fsSL -o ant.tar.gz https://archive.apache.org/dist/ant/binaries/apache-ant-1.8.4-bin.tar.gz
+          sudo tar -xzf ant.tar.gz -C /opt
+          echo "jdk6=/opt/zulu6.22.0.3-jdk6.0.119-linux_x64" >> "$GITHUB_OUTPUT"
+          echo "jdk7=/opt/zulu7.56.0.11-ca-jdk7.0.352-linux_x64" >> "$GITHUB_OUTPUT"
+          echo "/opt/apache-ant-1.8.4/bin" >> "$GITHUB_PATH"
+          # runner image presets ANT_HOME to its own Java-8-built Ant; the ant
+          # launcher script honours ANT_HOME, so point it at 1.8.4 explicitly
+          echo "ANT_HOME=/opt/apache-ant-1.8.4" >> "$GITHUB_ENV"
+
+      - name: Build jars (JDK 7)
+        env:
+          JAVA_HOME: ${{ steps.tools.outputs.jdk7 }}
+        run: |
+          set -euo pipefail
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          ant -version
+          ant jars.asl
+          ls -l build/*.jar
+
+      - name: Test (JDK 6)
+        env:
+          JAVA_HOME: ${{ steps.tools.outputs.jdk6 }}
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          if [ -n "$TEST_FILTER" ]; then
+            for t in $TEST_FILTER; do
+              ant test.single -Dtest="$t"
+            done
+          else
+            ant test
+            python3 - <<'EOF'
+          import glob, xml.etree.ElementTree as ET
+          tot = fail = err = skip = 0
+          for f in sorted(glob.glob('test/results/xml/TEST-*.xml')):
+              r = ET.parse(f).getroot()
+              tot += int(r.get('tests', 0)); fail += int(r.get('failures', 0))
+              err += int(r.get('errors', 0)); skip += int(r.get('skipped', 0) or 0)
+          print(f"TOTAL tests={tot} passed={tot-fail-err-skip} failures={fail} errors={err} skipped={skip}")
+          if tot == 0 or fail or err:
+              raise SystemExit(1)
+          EOF
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jackson-mapper-asl
+          path: build/jackson-mapper-asl-*.jar
+          if-no-files-found: error
